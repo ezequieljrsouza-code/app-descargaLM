@@ -2,16 +2,15 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from datetime import date
-from typing import Optional, List, Tuple, Dict
-
+from typing import Optional, List
 from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(page_title="Monitoramento LH", layout="wide")
 
 st.title("📦 Monitoramento LH")
 st.caption(
-    "Modo CSV (filtro SPA1/HOJE/!=RODOPENHA) ou modo IMAGEM (OCR) → consolida por PLACA → "
-    "ordena por horário → edita DOCA/STATUS → baixa CSV e PNG (WhatsApp)."
+    "CSV (filtro SPA1/HOJE/!=RODOPENHA) ou Imagem (OCR opcional) → consolida por PLACA → "
+    "edita DOCA/STATUS → baixa CSV e PNG (WhatsApp)."
 )
 
 DEFAULT_STATUS_OPTIONS = [
@@ -34,28 +33,17 @@ def fmt_hms_from_dt(dt_series: pd.Series) -> pd.Series:
     return s.fillna("")
 
 def fmt_hms_from_text(series: pd.Series) -> pd.Series:
-    # aceita "09:57", "09:57:00", etc → padroniza para HH:MM:SS
     s = series.fillna("").astype(str).str.strip()
     s = s.replace({"nan": "", "None": ""})
-    # se vier HH:MM, vira HH:MM:00
     s = s.where(~s.str.match(r"^\d{2}:\d{2}$"), s + ":00")
-    # se vier HH:MM:SS, mantém
-    # se vier vazio, mantém
     return s
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 def build_monitor_from_base(df_base: pd.DataFrame) -> pd.DataFrame:
-    """
-    Espera df_base com colunas:
-      PLACA, PACOTES, YMS IN, YMS OUT
-    Cria: ORDEM, DOCA, STATUS e reordena.
-    """
     out = df_base.copy()
 
-    # Ordenação: usa YMS IN se possível; senão YMS OUT; senão deixa por último
-    # Como YMS IN/YMS OUT são strings HH:MM:SS, criamos um sort_time artificial
     def parse_time_str(x: str):
         try:
             if not x:
@@ -83,14 +71,12 @@ def build_monitor_from_base(df_base: pd.DataFrame) -> pd.DataFrame:
     out.insert(0, "ORDEM", [f"{i}ª" for i in range(1, len(out) + 1)])
     out.insert(1, "DOCA", "")
     out["STATUS"] = "Aguardando Doca"
-
-    # Colunas finais
     out = out[["ORDEM", "DOCA", "PLACA", "YMS IN", "YMS OUT", "PACOTES", "STATUS"]]
     return out
 
 
 # =========================
-# CSV mode (com filtro)
+# CSV mode (com filtro fixo)
 # =========================
 @st.cache_data(show_spinner=False)
 def parse_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
@@ -104,7 +90,7 @@ def parse_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
     raise ValueError("Não consegui ler o CSV (verifique separador/codificação).")
 
 def apply_daily_filter_csv(raw: pd.DataFrame, x_value: str, day_value: date, e_exclude: str) -> pd.DataFrame:
-    # Fixos conforme você definiu
+    # Fixos conforme você informou
     col_x = "Destino"
     col_y = "Destino ATA"
     col_e = "Motorista"
@@ -154,126 +140,41 @@ def build_base_from_csv(filtered: pd.DataFrame) -> pd.DataFrame:
         "YMS IN": fmt_hms_from_dt(grouped["ATA"]),
         "YMS OUT": fmt_hms_from_dt(grouped["ATD"]),
     })
-
     return base
 
 
 # =========================
-# IMAGE mode (OCR)
+# IMAGE mode (OCR opcional; não derruba o app)
 # =========================
-def _try_import_tesseract():
+def ocr_available() -> bool:
     try:
-        import pytesseract  # type: ignore
-        return pytesseract
+        import pytesseract  # noqa
+        return True
     except Exception:
-        return None
+        return False
 
-def ocr_extract_table(image: Image.Image) -> pd.DataFrame:
+def ocr_extract_table_stub(image: Image.Image) -> pd.DataFrame:
     """
-    Extrai PLACA, PACOTES, Chegada-YMS (como YMS IN) de um print parecido com o anexo.
-    Requer pytesseract + tesseract instalado no ambiente.
+    Stub: só roda se pytesseract estiver disponível.
+    Se você hospedar em HuggingFace Docker com tesseract instalado,
+    você pode trocar esse stub pela versão OCR completa.
     """
-    pytesseract = _try_import_tesseract()
-    if pytesseract is None:
-        raise RuntimeError("pytesseract não está instalado. Veja requirements / Docker abaixo.")
+    import pytesseract  # type: ignore
+    # Se chegou aqui, pytesseract está importável, mas ainda pode faltar o binário "tesseract".
+    # Vamos testar uma chamada simples.
+    try:
+        _ = pytesseract.image_to_string(image)
+    except Exception as e:
+        raise RuntimeError(
+            "OCR não está pronto neste servidor (provavelmente falta o binário do Tesseract). "
+            "Use Hugging Face Spaces (Docker) para habilitar."
+        ) from e
 
-    # Pré-processamento simples (melhora OCR)
-    img = image.convert("RGB")
-    w, h = img.size
-    # aumenta um pouco para OCR
-    scale = 2 if max(w, h) < 2000 else 1
-    if scale != 1:
-        img = img.resize((w * scale, h * scale))
-
-    import numpy as np
-    import cv2  # type: ignore
-
-    arr = np.array(img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # OCR em formato "data" com bounding boxes
-    data = pytesseract.image_to_data(thr, output_type=pytesseract.Output.DATAFRAME, config="--psm 6")
-    data = data.dropna(subset=["text"])
-    data["text"] = data["text"].astype(str).str.strip()
-    data = data[data["text"] != ""]
-
-    # encontra colunas pelo header (Placa / Pacotes / Chegada / YMS)
-    # (o header no print costuma estar em uma faixa superior)
-    header_band = data[data["top"] < data["top"].quantile(0.25)].copy()
-
-    def find_x_of_word(word: str) -> Optional[int]:
-        m = header_band[header_band["text"].str.lower().str.contains(word)]
-        if len(m) == 0:
-            return None
-        # pega a mediana do x
-        return int(m["left"].median())
-
-    x_placa = find_x_of_word("plac")
-    x_pac = find_x_of_word("pacot")
-    x_chegada = find_x_of_word("chegad")
-    if x_placa is None or x_pac is None or x_chegada is None:
-        raise RuntimeError("Não consegui localizar os headers (Placa/Pacotes/Chegada) na imagem.")
-
-    # define cortes de coluna com base na ordem dos x
-    xs = sorted([("PLACA", x_placa), ("PACOTES", x_pac), ("CHEGADA", x_chegada)], key=lambda t: t[1])
-    # boundaries: meio do caminho entre colunas
-    bounds: Dict[str, Tuple[int, int]] = {}
-    for i, (name, x) in enumerate(xs):
-        left = 0 if i == 0 else (xs[i-1][1] + x) // 2
-        right = 10**9 if i == len(xs)-1 else (x + xs[i+1][1]) // 2
-        bounds[name] = (left, right)
-
-    # remove header words e tenta pegar "linhas" por coordenada Y
-    body = data[data["top"] >= data["top"].quantile(0.25)].copy()
-
-    # agrupa por linha usando a coordenada "top" aproximada
-    body["row_key"] = (body["top"] // 25)  # binning
-    rows = []
-    for rk, g in body.groupby("row_key"):
-        # ignora linhas muito curtas
-        if len(g) < 3:
-            continue
-
-        def collect(colname: str) -> str:
-            L, R = bounds[colname]
-            gg = g[(g["left"] >= L) & (g["left"] < R)].sort_values("left")
-            # junta tokens com espaço
-            return " ".join(gg["text"].tolist()).strip()
-
-        placa_txt = collect("PLACA")
-        pac_txt = collect("PACOTES")
-        cheg_txt = collect("CHEGADA")
-
-        # Heurísticas de validade:
-        # placa: alfanum 6-8 chars, pacotes: número, chegada: HH:MM ou HH:MM:SS
-        if not placa_txt or len(placa_txt) < 5:
-            continue
-
-        pac_num = pd.to_numeric(pac_txt.replace(".", "").replace(",", ""), errors="coerce")
-        if pd.isna(pac_num):
-            continue
-
-        # busca o primeiro horário dentro do texto de chegada
-        import re
-        m = re.search(r"\b(\d{2}:\d{2}(?::\d{2})?)\b", cheg_txt)
-        chegada = m.group(1) if m else ""
-
-        rows.append({
-            "PLACA": placa_txt.strip().upper(),
-            "PACOTES": int(pac_num),
-            "YMS IN": chegada,
-            "YMS OUT": "",  # normalmente não existe no print
-        })
-
-    if not rows:
-        raise RuntimeError("OCR não encontrou linhas válidas. Tente uma imagem mais nítida/sem zoom.")
-
-    base = pd.DataFrame(rows).drop_duplicates(subset=["PLACA"], keep="first").reset_index(drop=True)
-    base["YMS IN"] = fmt_hms_from_text(base["YMS IN"])
-    base["YMS OUT"] = fmt_hms_from_text(base["YMS OUT"])
-    return base
+    # Como fallback mínimo, retorna vazio e orienta.
+    raise RuntimeError(
+        "OCR importou, mas este app está com stub. "
+        "Se você quiser, eu te mando a versão OCR completa para Hugging Face (Docker) e ela preenche PLACA/PACOTES/CHEGADA."
+    )
 
 
 # =========================
@@ -292,24 +193,19 @@ def get_fonts():
                 continue
         return ImageFont.load_default()
 
-    return {
-        "title": load_font(30),
-        "header": load_font(16),
-        "cell": load_font(16),
-        "bold": load_font(18),
-    }
+    return {"title": load_font(30), "header": load_font(16), "cell": load_font(16), "bold": load_font(18)}
 
 def status_style(status: str):
     s = (status or "").strip().lower()
     if "descarga inici" in s:
-        return {"fill": (255, 235, 59), "text": (0, 0, 0)}          # amarelo
+        return {"fill": (255, 235, 59), "text": (0, 0, 0)}
     if "conclu" in s:
-        return {"fill": (22, 120, 74), "text": (255, 255, 255)}    # verde
+        return {"fill": (22, 120, 74), "text": (255, 255, 255)}
     if "aguardando" in s:
-        return {"fill": (70, 70, 70), "text": (255, 255, 255)}     # cinza escuro
+        return {"fill": (70, 70, 70), "text": (255, 255, 255)}
     if "não chegou" in s or "nao chegou" in s:
-        return {"fill": (255, 165, 0), "text": (255, 255, 255)}    # laranja
-    return {"fill": (200, 200, 200), "text": (0, 0, 0)}            # cinza claro
+        return {"fill": (255, 165, 0), "text": (255, 255, 255)}
+    return {"fill": (200, 200, 200), "text": (0, 0, 0)}
 
 def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
     df = df.head(max_rows).copy()
@@ -323,15 +219,7 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
     row_h = 44
 
     cols = ["ORDEM", "DOCA", "PLACA", "YMS IN", "YMS OUT", "PACOTES", "STATUS"]
-    col_w = {
-        "ORDEM": 90,
-        "DOCA": 90,
-        "PLACA": 180,
-        "YMS IN": 120,
-        "YMS OUT": 120,
-        "PACOTES": 130,
-        "STATUS": 250,
-    }
+    col_w = {"ORDEM": 90, "DOCA": 90, "PLACA": 180, "YMS IN": 120, "YMS OUT": 120, "PACOTES": 130, "STATUS": 250}
 
     width = sum(col_w[c] for c in cols)
     height = title_h + header_h + row_h * max(1, len(df)) + 20
@@ -340,10 +228,7 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
     draw = ImageDraw.Draw(img)
 
     fonts = get_fonts()
-    font_title = fonts["title"]
-    font_header = fonts["header"]
-    font_cell = fonts["cell"]
-    font_bold = fonts["bold"]
+    font_title, font_header, font_cell, font_bold = fonts["title"], fonts["header"], fonts["cell"], fonts["bold"]
 
     draw.rectangle([0, 0, width, title_h], fill=orange)
     title = "MONITORAMENTO LH"
@@ -374,14 +259,12 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
 
             if c == "STATUS":
                 sty = status_style(val)
-                pill_pad = 8
-                pill_h = 30
+                pill_pad, pill_h = 8, 30
                 pill_w = col_w[c] - 2 * pill_pad
                 pill_x0 = x + pill_pad
                 pill_y0 = y + (row_h - pill_h) // 2
                 pill_x1 = pill_x0 + pill_w
                 pill_y1 = pill_y0 + pill_h
-
                 try:
                     draw.rounded_rectangle([pill_x0, pill_y0, pill_x1, pill_y1], radius=14, fill=sty["fill"])
                 except Exception:
@@ -389,17 +272,12 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
 
                 bbox = draw.textbbox((0, 0), val, font=font_bold)
                 lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                draw.text(
-                    (pill_x0 + (pill_w - lw) / 2, pill_y0 + (pill_h - lh) / 2 - 1),
-                    val, fill=sty["text"], font=font_bold
-                )
+                draw.text((pill_x0 + (pill_w - lw) / 2, pill_y0 + (pill_h - lh) / 2 - 1), val, fill=sty["text"], font=font_bold)
+
                 arrow = "▾"
                 bbox = draw.textbbox((0, 0), arrow, font=font_bold)
                 aw, ah = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                draw.text(
-                    (pill_x1 - aw - 10, pill_y0 + (pill_h - ah) / 2 - 1),
-                    arrow, fill=sty["text"], font=font_bold
-                )
+                draw.text((pill_x1 - aw - 10, pill_y0 + (pill_h - ah) / 2 - 1), arrow, fill=sty["text"], font=font_bold)
             else:
                 font_use = font_bold if c in ["ORDEM", "DOCA"] else font_cell
                 bbox = draw.textbbox((0, 0), val, font=font_use)
@@ -408,7 +286,6 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
 
             x += col_w[c]
 
-        draw.line([0, y + row_h, width, y + row_h], fill=(240, 240, 240), width=2)
         y += row_h
 
     out = BytesIO()
@@ -417,7 +294,7 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
 
 
 # =========================
-# UI — Modo de entrada
+# UI
 # =========================
 mode = st.radio("Escolha a fonte dos dados:", ["📄 CSV (com filtro do dia)", "🖼️ Imagem (OCR)"], horizontal=True)
 
@@ -428,8 +305,7 @@ if mode.startswith("📄"):
     if not uploaded:
         st.stop()
 
-    file_bytes = uploaded.getvalue()
-    raw = parse_csv_bytes(file_bytes)
+    raw = parse_csv_bytes(uploaded.getvalue())
 
     st.subheader("🧰 Filtro do dia (igual Excel FILTER)")
     c1, c2, c3 = st.columns([1, 1, 1])
@@ -440,87 +316,60 @@ if mode.startswith("📄"):
     with c3:
         e_exclude = st.text_input('Motorista (E) <>', value="RODOPENHA")
 
-    with st.expander("🔎 Prévia do CSV (5 linhas)", expanded=False):
-        st.dataframe(raw.head(5), use_container_width=True)
-
     filtered = apply_daily_filter_csv(raw, x_value=x_value, day_value=day_value, e_exclude=e_exclude)
-    st.info(f"Linhas após filtro: **{len(filtered)}** (antes: {len(raw)})")
+    st.info(f"Linhas após filtro: **{len(filtered)}**")
 
     base_df = build_base_from_csv(filtered)
 
 else:
-    uploaded_img = st.file_uploader("📤 Envie a IMAGEM (print da planilha)", type=["png", "jpg", "jpeg", "webp"])
+    uploaded_img = st.file_uploader("📤 Envie a IMAGEM (print)", type=["png", "jpg", "jpeg", "webp"])
     if not uploaded_img:
         st.stop()
 
     image = Image.open(uploaded_img)
     st.image(image, caption="Imagem enviada", use_container_width=True)
 
-    st.warning(
-        "A extração por OCR precisa do Tesseract instalado no servidor. "
-        "Se você estiver no Streamlit Community Cloud e der erro, use o Hugging Face Spaces (Docker) — instruções abaixo."
-    )
+    if not ocr_available():
+        st.error(
+            "OCR não está disponível neste servidor (Streamlit Cloud geralmente não tem Tesseract). "
+            "Para OCR grátis, use Hugging Face Spaces (Docker)."
+        )
+        st.stop()
 
     if st.button("Extrair dados da imagem (OCR)"):
-        with st.spinner("Lendo a imagem..."):
-            try:
-                base_df = ocr_extract_table(image)
-                st.success(f"OCR ok! Placas encontradas: {len(base_df)}")
-            except Exception as e:
-                st.error(f"Falha no OCR: {e}")
-                st.stop()
+        try:
+            base_df = ocr_extract_table_stub(image)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
 
-# =========================
-# Se base pronta → gera monitoramento, edição e export
-# =========================
 if base_df is None or base_df.empty:
     st.stop()
 
 monitor = build_monitor_from_base(base_df)
 
 st.subheader("✍️ Edite DOCA e STATUS")
-status_options_text = st.text_area(
-    "Opções de STATUS (uma por linha)",
-    value="\n".join(DEFAULT_STATUS_OPTIONS),
-    height=110
-)
+status_options_text = st.text_area("Opções de STATUS (uma por linha)", value="\n".join(DEFAULT_STATUS_OPTIONS), height=110)
 status_list = [s.strip() for s in status_options_text.splitlines() if s.strip()]
-
-column_config = {
-    "DOCA": st.column_config.TextColumn("DOCA", help="Digite a doca manualmente"),
-    "STATUS": st.column_config.SelectboxColumn("STATUS", options=status_list, required=False),
-}
 
 edited = st.data_editor(
     monitor,
     use_container_width=True,
     hide_index=True,
-    column_config=column_config,
+    column_config={
+        "DOCA": st.column_config.TextColumn("DOCA"),
+        "STATUS": st.column_config.SelectboxColumn("STATUS", options=status_list, required=False),
+    },
     num_rows="fixed",
     key="editor",
 )
 
-st.divider()
-
-st.download_button(
-    "⬇️ Baixar CSV atualizado",
-    data=df_to_csv_bytes(edited),
-    file_name="monitoramento_lh_atualizado.csv",
-    mime="text/csv",
-)
+st.download_button("⬇️ Baixar CSV atualizado", data=df_to_csv_bytes(edited), file_name="monitoramento_lh_atualizado.csv", mime="text/csv")
 
 st.subheader("🖼️ Imagem para WhatsApp (sob demanda)")
 max_rows = st.slider("Quantidade de linhas na imagem", min_value=5, max_value=40, value=25, step=1)
 
 if st.button("Gerar imagem PNG"):
-    with st.spinner("Gerando imagem..."):
-        png_bytes = render_monitor_png(edited, max_rows=max_rows)
-    st.image(png_bytes, caption="Imagem gerada (pronta para baixar e enviar)", use_container_width=True)
-    st.download_button(
-        "Baixar imagem PNG",
-        data=png_bytes,
-        file_name="monitoramento_lh.png",
-        mime="image/png",
-    )
-else:
-    st.caption("Clique em **Gerar imagem PNG** (assim não fica lento enquanto você edita).")
+    png_bytes = render_monitor_png(edited, max_rows=max_rows)
+    st.image(png_bytes, caption="Imagem gerada", use_container_width=True)
+    st.download_button("Baixar imagem PNG", data=png_bytes, file_name="monitoramento_lh.png", mime="image/png")
