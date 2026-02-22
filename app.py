@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
+from typing import Optional, List
 
 st.set_page_config(page_title="Monitoramento LH", layout="wide")
 
@@ -28,7 +29,7 @@ def read_csv_smart(uploaded_file) -> pd.DataFrame:
             pass
     raise ValueError("Não consegui ler o CSV (verifique separador/codificação).")
 
-def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = list(df.columns)
     lower_map = {c.lower().strip(): c for c in cols}
     for cand in candidates:
@@ -41,12 +42,10 @@ def to_dt(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", dayfirst=True)
 
 def fmt_hms(dt_series: pd.Series) -> pd.Series:
-    # retorna string hh:mm:ss (vazio quando NaT)
     s = dt_series.dt.strftime("%H:%M:%S")
     return s.fillna("")
 
 def build_monitor_df(raw: pd.DataFrame) -> pd.DataFrame:
-    # Colunas do CSV
     col_placa = find_col(raw, ["Veículo de carga 1", "VEÍCULO DE CARGA 1"])
     col_ata   = find_col(raw, ["Destino ATA", "DESTINO ATA"])
     col_atd   = find_col(raw, ["Destino ATD", "DESTINO ATD"])
@@ -59,7 +58,7 @@ def build_monitor_df(raw: pd.DataFrame) -> pd.DataFrame:
         ("Pacotes", col_pac),
     ] if col is None]
     if missing:
-        raise ValueError(f"Não encontrei as colunas obrigatórias no CSV: {', '.join(missing)}")
+        raise ValueError("Não encontrei as colunas obrigatórias no CSV: " + ", ".join(missing))
 
     df = raw.copy()
     df[col_placa] = df[col_placa].astype(str).str.strip().str.upper()
@@ -73,54 +72,45 @@ def build_monitor_df(raw: pd.DataFrame) -> pd.DataFrame:
     grouped = (
         df.groupby(col_placa, dropna=False)
           .agg(
-              ATA=("__ATA", "min"),     # primeiro ATA
-              ATD=("__ATD", "max"),     # último ATD
-              PACOTES=("__PAC", "sum"), # soma pacotes
+              ATA=("__ATA", "min"),
+              ATD=("__ATD", "max"),
+              PACOTES=("__PAC", "sum"),
           )
           .reset_index()
           .rename(columns={col_placa: "PLACA"})
     )
 
-    # Ordenação: primeiro pelo ATA; se não tiver, pelo ATD
     grouped["__SORT"] = grouped["ATA"].fillna(grouped["ATD"])
     grouped = grouped.sort_values(by="__SORT", ascending=True, na_position="last").reset_index(drop=True)
 
-    # ORDEM como 1ª, 2ª, 3ª...
     grouped.insert(0, "ORDEM", [f"{i}ª" for i in range(1, len(grouped) + 1)])
-
-    # DOCA e STATUS editáveis
     grouped.insert(1, "DOCA", "")
     grouped["STATUS"] = "Aguardando Doca"
 
-    # Formata horas para hh:mm:ss
     grouped["YMS IN"] = fmt_hms(grouped["ATA"])
     grouped["YMS OUT"] = fmt_hms(grouped["ATD"])
 
-    # Reordena/limpa
     grouped = grouped.drop(columns=["ATA", "ATD", "__SORT"])
     grouped = grouped[["ORDEM", "DOCA", "PLACA", "YMS IN", "YMS OUT", "PACOTES", "STATUS"]]
-
     return grouped
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
-
 # ---------- Render imagem (PNG) ----------
 def status_style(status: str):
     s = (status or "").strip().lower()
     if "descarga inici" in s:
-        return {"fill": (255, 235, 59), "text": (0, 0, 0)}   # amarelo
+        return {"fill": (255, 235, 59), "text": (0, 0, 0)}          # amarelo
     if "conclu" in s:
-        return {"fill": (22, 120, 74), "text": (255, 255, 255)}  # verde
+        return {"fill": (22, 120, 74), "text": (255, 255, 255)}    # verde
     if "aguardando" in s:
-        return {"fill": (70, 70, 70), "text": (255, 255, 255)}   # cinza escuro
+        return {"fill": (70, 70, 70), "text": (255, 255, 255)}     # cinza escuro
     if "não chegou" in s or "nao chegou" in s:
-        return {"fill": (255, 165, 0), "text": (255, 255, 255)}  # laranja
-    return {"fill": (200, 200, 200), "text": (0, 0, 0)}          # cinza claro
+        return {"fill": (255, 165, 0), "text": (255, 255, 255)}    # laranja
+    return {"fill": (200, 200, 200), "text": (0, 0, 0)}            # cinza claro
 
 def load_font(size: int):
-    # tenta fontes comuns do linux; cai em default se não achar
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -133,7 +123,6 @@ def load_font(size: int):
     return ImageFont.load_default()
 
 def render_monitor_png(df: pd.DataFrame) -> bytes:
-    # Layout
     orange = (255, 140, 0)
     white = (255, 255, 255)
     black = (0, 0, 0)
@@ -143,7 +132,6 @@ def render_monitor_png(df: pd.DataFrame) -> bytes:
     row_h = 44
     pad_x = 14
 
-    # Larguras por coluna (ajustadas para parecer com o anexo)
     cols = ["ORDEM", "DOCA", "PLACA", "YMS IN", "YMS OUT", "PACOTES", "STATUS"]
     col_w = {
         "ORDEM": 90,
@@ -166,44 +154,39 @@ def render_monitor_png(df: pd.DataFrame) -> bytes:
     font_cell = load_font(16)
     font_bold = load_font(18)
 
-    # Title bar
+    # Title
     draw.rectangle([0, 0, width, title_h], fill=orange)
     title = "MONITORAMENTO LH"
-    tw, th = draw.textbbox((0, 0), title, font=font_title)[2:]
+    bbox = draw.textbbox((0, 0), title, font=font_title)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(((width - tw) / 2, (title_h - th) / 2), title, fill=white, font=font_title)
 
-    # Header row
+    # Header
     y0 = title_h
     draw.rectangle([0, y0, width, y0 + header_h], fill=orange)
 
     x = 0
     for c in cols:
-        # separador
         draw.line([x, y0, x, y0 + header_h], fill=white, width=2)
-        label = c
-        lw, lh = draw.textbbox((0, 0), label, font=font_header)[2:]
-        draw.text((x + (col_w[c] - lw) / 2, y0 + (header_h - lh) / 2), label, fill=white, font=font_header)
+        bbox = draw.textbbox((0, 0), c, font=font_header)
+        lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text((x + (col_w[c] - lw) / 2, y0 + (header_h - lh) / 2), c, fill=white, font=font_header)
         x += col_w[c]
     draw.line([width - 1, y0, width - 1, y0 + header_h], fill=white, width=2)
 
-    # Body rows
+    # Rows
     y = y0 + header_h
     for i in range(len(df)):
         row = df.iloc[i]
-        # background (branco)
         draw.rectangle([0, y, width, y + row_h], fill=white)
 
         x = 0
         for c in cols:
-            # cell text
             val = "" if pd.isna(row[c]) else str(row[c])
-
-            # vertical separator
             draw.line([x, y, x, y + row_h], fill=(230, 230, 230), width=2)
 
             if c == "STATUS":
                 sty = status_style(val)
-                # pill
                 pill_pad = 8
                 pill_h = 30
                 pill_w = col_w[c] - 2 * pill_pad
@@ -212,49 +195,39 @@ def render_monitor_png(df: pd.DataFrame) -> bytes:
                 pill_x1 = pill_x0 + pill_w
                 pill_y1 = pill_y0 + pill_h
 
-                # rounded rectangle (Pillow <= usa radius via rounded_rectangle)
                 try:
                     draw.rounded_rectangle([pill_x0, pill_y0, pill_x1, pill_y1], radius=14, fill=sty["fill"])
                 except Exception:
                     draw.rectangle([pill_x0, pill_y0, pill_x1, pill_y1], fill=sty["fill"])
 
-                # texto central
-                txt = val
-                lw, lh = draw.textbbox((0, 0), txt, font=font_bold)[2:]
-                draw.text((pill_x0 + (pill_w - lw) / 2, pill_y0 + (pill_h - lh) / 2 - 1), txt, fill=sty["text"], font=font_bold)
+                bbox = draw.textbbox((0, 0), val, font=font_bold)
+                lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                draw.text((pill_x0 + (pill_w - lw) / 2, pill_y0 + (pill_h - lh) / 2 - 1), val, fill=sty["text"], font=font_bold)
 
-                # setinha (visual)
                 arrow = "▾"
-                aw, ah = draw.textbbox((0, 0), arrow, font=font_bold)[2:]
+                bbox = draw.textbbox((0, 0), arrow, font=font_bold)
+                aw, ah = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 draw.text((pill_x1 - aw - 10, pill_y0 + (pill_h - ah) / 2 - 1), arrow, fill=sty["text"], font=font_bold)
 
             else:
-                # alinhamentos
-                if c in ["ORDEM", "DOCA"]:
-                    font_use = font_bold
-                else:
-                    font_use = font_cell
-
-                # centraliza números/horas, placa centralizada, pacotes centralizado
+                font_use = font_bold if c in ["ORDEM", "DOCA"] else font_cell
                 if c in ["ORDEM", "DOCA", "YMS IN", "YMS OUT", "PACOTES", "PLACA"]:
-                    lw, lh = draw.textbbox((0, 0), val, font=font_use)[2:]
+                    bbox = draw.textbbox((0, 0), val, font=font_use)
+                    lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
                     draw.text((x + (col_w[c] - lw) / 2, y + (row_h - lh) / 2), val, fill=black, font=font_use)
                 else:
                     draw.text((x + pad_x, y + 10), val, fill=black, font=font_use)
 
             x += col_w[c]
 
-        # horizontal separator
         draw.line([0, y + row_h, width, y + row_h], fill=(240, 240, 240), width=2)
         y += row_h
 
-    # borda final
     draw.rectangle([0, title_h, width - 1, height - 1], outline=(230, 230, 230), width=2)
 
     out = BytesIO()
     img.save(out, format="PNG")
     return out.getvalue()
-
 
 # ---------- UI ----------
 uploaded = st.file_uploader("📤 Envie o CSV", type=["csv"])
@@ -303,7 +276,6 @@ edited = st.data_editor(
 
 st.divider()
 
-# Downloads
 c1, c2 = st.columns([1, 1])
 
 with c1:
@@ -316,11 +288,9 @@ with c1:
     )
 
 with c2:
-    st.subheader("🖼️ Gerar imagem (WhatsApp)")
+    st.subheader("🖼️ Imagem (WhatsApp)")
     png_bytes = render_monitor_png(edited)
-
-    st.image(png_bytes, caption="Imagem gerada (pronta para copiar/baixar e enviar no WhatsApp)", use_container_width=True)
-
+    st.image(png_bytes, caption="Imagem gerada (pronta para baixar e enviar)", use_container_width=True)
     st.download_button(
         "Baixar imagem PNG",
         data=png_bytes,
