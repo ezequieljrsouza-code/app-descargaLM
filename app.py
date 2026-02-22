@@ -2,15 +2,15 @@ import streamlit as st
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
-from typing import Optional, List, Dict
+from typing import Optional, List
 from datetime import date
 
 st.set_page_config(page_title="Monitoramento LH", layout="wide")
 
 st.title("📦 Monitoramento LH")
 st.caption(
-    "Upload do CSV → aplica filtro do dia (SPA1, hoje, != RODOPENHA) → consolida por PLACA → "
-    "ordena por horário → edita DOCA/STATUS → baixa CSV e PNG (WhatsApp)."
+    "Upload do CSV → filtro do dia (Destino=SPA1, data(Destino ATA)=hoje, Motorista!=RODOPENHA) → "
+    "consolida por PLACA → edita DOCA/STATUS → baixa CSV e PNG (WhatsApp)."
 )
 
 DEFAULT_STATUS_OPTIONS = [
@@ -42,7 +42,7 @@ def fmt_hms(dt_series: pd.Series) -> pd.Series:
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
-# ----------------- Caching: parse & base processing -----------------
+# ----------------- Cache: parse -----------------
 @st.cache_data(show_spinner=False)
 def parse_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
     for sep in [",", ";", "\t", "|"]:
@@ -54,36 +54,37 @@ def parse_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
             pass
     raise ValueError("Não consegui ler o CSV (verifique separador/codificação).")
 
-def apply_daily_filter(
-    raw: pd.DataFrame,
-    col_x: str,
-    col_y: str,
-    col_e: str,
-    x_value: str,
-    day_value: date,
-    e_exclude: str,
-) -> pd.DataFrame:
-    # X = "SPA1"
-    x_ok = raw[col_x].astype(str).str.strip().eq(str(x_value).strip())
+# ----------------- Filtering & grouping -----------------
+def apply_daily_filter(raw: pd.DataFrame, x_value: str, day_value: date, e_exclude: str) -> pd.DataFrame:
+    # Colunas fixas conforme você informou
+    col_x = "Destino"
+    col_y = "Destino ATA"
+    col_e = "Motorista"
 
-    # INT(Y) = HOJE()  -> date(Y) == day_value
+    # Valida existência
+    missing = [c for c in [col_x, col_y, col_e] if c not in raw.columns]
+    if missing:
+        raise ValueError(f"CSV não tem as colunas necessárias para o filtro: {', '.join(missing)}")
+
+    x_ok = raw[col_x].astype(str).str.strip().eq(str(x_value).strip())
     y_dt = to_dt(raw[col_y])
     y_ok = y_dt.dt.date.eq(day_value)
-
-    # E <> "RODOPENHA"
     e_ok = raw[col_e].astype(str).str.strip().ne(str(e_exclude).strip())
 
     return raw[x_ok & y_ok & e_ok].copy()
 
-def build_monitor_df_from_filtered(
-    filtered: pd.DataFrame,
-    col_placa: str,
-    col_ata: str,
-    col_atd: str,
-    col_pac: str,
-) -> pd.DataFrame:
-    df = filtered.copy()
+def build_monitor_df(filtered: pd.DataFrame) -> pd.DataFrame:
+    # Colunas fixas
+    col_placa = "Veículo de carga 1"
+    col_ata = "Destino ATA"
+    col_atd = "Destino ATD"
+    col_pac = "Pacotes"
 
+    missing = [c for c in [col_placa, col_ata, col_atd, col_pac] if c not in filtered.columns]
+    if missing:
+        raise ValueError(f"CSV filtrado não tem as colunas necessárias: {', '.join(missing)}")
+
+    df = filtered.copy()
     df[col_placa] = df[col_placa].astype(str).str.strip().str.upper()
     df["__ATA"] = to_dt(df[col_ata])
     df["__ATD"] = to_dt(df[col_atd])
@@ -116,7 +117,7 @@ def build_monitor_df_from_filtered(
     grouped = grouped[["ORDEM", "DOCA", "PLACA", "YMS IN", "YMS OUT", "PACOTES", "STATUS"]]
     return grouped
 
-# ----------------- PNG (gerar somente sob demanda) -----------------
+# ----------------- PNG rendering (on demand) -----------------
 @st.cache_resource
 def get_fonts():
     def load_font(size: int):
@@ -150,7 +151,6 @@ def status_style(status: str):
     return {"fill": (200, 200, 200), "text": (0, 0, 0)}            # cinza claro
 
 def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
-    # Limita linhas para não ficar pesado (WhatsApp também fica melhor)
     df = df.head(max_rows).copy()
 
     orange = (255, 140, 0)
@@ -160,7 +160,6 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
     title_h = 70
     header_h = 40
     row_h = 44
-    pad_x = 14
 
     cols = ["ORDEM", "DOCA", "PLACA", "YMS IN", "YMS OUT", "PACOTES", "STATUS"]
     col_w = {
@@ -203,7 +202,6 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
         lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.text((x + (col_w[c] - lw) / 2, y0 + (header_h - lh) / 2), c, fill=white, font=font_header)
         x += col_w[c]
-    draw.line([width - 1, y0, width - 1, y0 + header_h], fill=white, width=2)
 
     # Rows
     y = y0 + header_h
@@ -233,22 +231,26 @@ def render_monitor_png(df: pd.DataFrame, max_rows: int = 25) -> bytes:
 
                 bbox = draw.textbbox((0, 0), val, font=font_bold)
                 lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                draw.text((pill_x0 + (pill_w - lw) / 2, pill_y0 + (pill_h - lh) / 2 - 1),
-                          val, fill=sty["text"], font=font_bold)
-
+                draw.text(
+                    (pill_x0 + (pill_w - lw) / 2, pill_y0 + (pill_h - lh) / 2 - 1),
+                    val,
+                    fill=sty["text"],
+                    font=font_bold,
+                )
                 arrow = "▾"
                 bbox = draw.textbbox((0, 0), arrow, font=font_bold)
                 aw, ah = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                draw.text((pill_x1 - aw - 10, pill_y0 + (pill_h - ah) / 2 - 1),
-                          arrow, fill=sty["text"], font=font_bold)
+                draw.text(
+                    (pill_x1 - aw - 10, pill_y0 + (pill_h - ah) / 2 - 1),
+                    arrow,
+                    fill=sty["text"],
+                    font=font_bold,
+                )
             else:
                 font_use = font_bold if c in ["ORDEM", "DOCA"] else font_cell
-                if c in ["ORDEM", "DOCA", "YMS IN", "YMS OUT", "PACOTES", "PLACA"]:
-                    bbox = draw.textbbox((0, 0), val, font=font_use)
-                    lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                    draw.text((x + (col_w[c] - lw) / 2, y + (row_h - lh) / 2), val, fill=black, font=font_use)
-                else:
-                    draw.text((x + pad_x, y + 10), val, fill=black, font=font_use)
+                bbox = draw.textbbox((0, 0), val, font=font_use)
+                lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                draw.text((x + (col_w[c] - lw) / 2, y + (row_h - lh) / 2), val, fill=black, font=font_use)
 
             x += col_w[c]
 
@@ -273,76 +275,34 @@ except Exception as e:
     st.error(f"Erro lendo CSV: {e}")
     st.stop()
 
-# ---- Colunas do filtro (equivalentes a X, Y, E) ----
-st.subheader("🧰 Filtro do dia (igual ao Excel FILTER)")
-
-# Valores do filtro (editáveis)
-cA, cB, cC = st.columns([1, 1, 1])
-with cA:
-    x_value = st.text_input('Valor para X (ex: "SPA1")', value="SPA1")
-with cB:
-    day_value = st.date_input("Data (HOJE)", value=date.today())
-with cC:
-    e_exclude = st.text_input('Excluir E (ex: "RODOPENHA")', value="RODOPENHA")
-
-# Auto-detect (você pode ajustar os candidates conforme seus headers reais)
-default_col_x = find_col(raw, ["SPA", "Site", "Unidade", "Planta", "Destino", "X"])
-default_col_y = find_col(raw, ["Destino ATA", "ATA", "Data", "Data/Hora", "Y", "Agendamento"])
-default_col_e = find_col(raw, ["Transportadora", "Fornecedor", "Cliente", "E"])
-
-# Dropdowns (se auto-detect falhar, você escolhe)
-cols = list(raw.columns)
+# Filtro do dia (editáveis)
+st.subheader("🧰 Filtro do dia")
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    col_x = st.selectbox("Coluna X (deve ser SPA1)", options=cols, index=cols.index(default_col_x) if default_col_x in cols else 0)
+    x_value = st.text_input('Destino (X) =', value="SPA1")
 with c2:
-    col_y = st.selectbox("Coluna Y (data/hora para HOJE)", options=cols, index=cols.index(default_col_y) if default_col_y in cols else 0)
+    day_value = st.date_input("Data (HOJE) baseada em Destino ATA", value=date.today())
 with c3:
-    col_e = st.selectbox("Coluna E (excluir RODOPENHA)", options=cols, index=cols.index(default_col_e) if default_col_e in cols else 0)
+    e_exclude = st.text_input('Motorista (E) <>', value="RODOPENHA")
 
 with st.expander("🔎 Prévia do CSV (5 linhas)", expanded=False):
     st.dataframe(raw.head(5), use_container_width=True)
 
-# Aplica filtro (rápido)
-filtered = apply_daily_filter(
-    raw=raw,
-    col_x=col_x,
-    col_y=col_y,
-    col_e=col_e,
-    x_value=x_value,
-    day_value=day_value,
-    e_exclude=e_exclude,
-)
+try:
+    filtered = apply_daily_filter(raw, x_value=x_value, day_value=day_value, e_exclude=e_exclude)
+except Exception as e:
+    st.error(f"Erro no filtro: {e}")
+    st.stop()
 
 st.info(f"Linhas após filtro: **{len(filtered)}** (antes: {len(raw)})")
 
-# ---- Colunas para consolidar (placa/ata/atd/pacotes) ----
-st.subheader("🧾 Consolidação por placa")
-
-default_placa = find_col(filtered, ["Veículo de carga 1", "VEÍCULO DE CARGA 1"])
-default_ata   = find_col(filtered, ["Destino ATA", "DESTINO ATA"])
-default_atd   = find_col(filtered, ["Destino ATD", "DESTINO ATD"])
-default_pac   = find_col(filtered, ["Pacotes", "PACOTES", "Qtd Pacotes", "Quantidade de Pacotes"])
-
-cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
-with cc1:
-    col_placa = st.selectbox("Coluna PLACA", options=list(filtered.columns), index=list(filtered.columns).index(default_placa) if default_placa in list(filtered.columns) else 0)
-with cc2:
-    col_ata = st.selectbox("Coluna Destino ATA", options=list(filtered.columns), index=list(filtered.columns).index(default_ata) if default_ata in list(filtered.columns) else 0)
-with cc3:
-    col_atd = st.selectbox("Coluna Destino ATD", options=list(filtered.columns), index=list(filtered.columns).index(default_atd) if default_atd in list(filtered.columns) else 0)
-with cc4:
-    col_pac = st.selectbox("Coluna Pacotes", options=list(filtered.columns), index=list(filtered.columns).index(default_pac) if default_pac in list(filtered.columns) else 0)
-
-# Monta monitor (sem cache aqui porque depende das colunas escolhidas; ainda é leve porque já filtrou)
 try:
-    monitor = build_monitor_df_from_filtered(filtered, col_placa, col_ata, col_atd, col_pac)
+    monitor = build_monitor_df(filtered)
 except Exception as e:
     st.error(f"Erro consolidando dados: {e}")
     st.stop()
 
-st.subheader("✍️ Edite DOCA e STATUS (rápido)")
-
+st.subheader("✍️ Edite DOCA e STATUS")
 status_options_text = st.text_area(
     "Opções de STATUS (uma por linha)",
     value="\n".join(DEFAULT_STATUS_OPTIONS),
@@ -366,7 +326,6 @@ edited = st.data_editor(
 
 st.divider()
 
-# Downloads CSV
 st.download_button(
     "⬇️ Baixar CSV atualizado",
     data=df_to_csv_bytes(edited),
@@ -374,7 +333,6 @@ st.download_button(
     mime="text/csv",
 )
 
-# PNG sob demanda (não gera em todo rerun)
 st.subheader("🖼️ Imagem para WhatsApp")
 max_rows = st.slider("Quantidade de linhas na imagem", min_value=5, max_value=40, value=25, step=1)
 
